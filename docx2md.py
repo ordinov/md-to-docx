@@ -279,13 +279,23 @@ def docx_to_md(docx_path):
         if not rows:
             return []
 
+        def format_row(cells):
+            """Format a row with proper spacing."""
+            parts = []
+            for cell in cells:
+                if cell:
+                    parts.append(f" {cell} ")
+                else:
+                    parts.append(" ")  # Empty cell = single space
+            return "|" + "|".join(parts) + "|"
+
         md_table = []
         # Header row
         if rows:
-            # Use header cell widths + 2 for separators (matches typical markdown editors)
+            # Use header cell widths + 2 for separators (standard padding)
             col_widths = [max(len(cell) + 2, 3) for cell in rows[0]]
 
-            md_table.append("| " + " | ".join(rows[0]) + " |")
+            md_table.append(format_row(rows[0]))
             separators = ["-" * w for w in col_widths]
             md_table.append("|" + "|".join(separators) + "|")
             # Data rows
@@ -293,7 +303,7 @@ def docx_to_md(docx_path):
                 # Pad row if necessary
                 while len(row) < len(rows[0]):
                     row.append("")
-                md_table.append("| " + " | ".join(row) + " |")
+                md_table.append(format_row(row))
 
         return md_table
 
