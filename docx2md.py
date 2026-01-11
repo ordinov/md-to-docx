@@ -88,6 +88,7 @@ def docx_to_md(docx_path):
     from docx import Document
     from docx.shared import Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
 
     docx_path = Path(docx_path)
 
@@ -96,12 +97,28 @@ def docx_to_md(docx_path):
         sys.exit(1)
 
     if docx_path.suffix.lower() != '.docx':
-        print(f"Warning: File doesn't have .docx extension: {docx_path}")
+        print(f"Error: File must have .docx extension: {docx_path}")
+        print("Use md2docx.py to convert .md files to .docx")
+        sys.exit(1)
 
     md_path = docx_path.with_suffix('.md')
 
+    # Handle existing file
+    if md_path.exists():
+        response = input(f"File '{md_path.name}' already exists. Overwrite? (y/n): ").strip().lower()
+        if response not in ('y', 's', 'yes', 'si'):
+            # Find next available number
+            counter = 1
+            while True:
+                new_path = md_path.parent / f"{md_path.stem} ({counter}){md_path.suffix}"
+                if not new_path.exists():
+                    md_path = new_path
+                    break
+                counter += 1
+
     doc = Document(docx_path)
     md_lines = []
+    list_number_counter = 0  # Track numbered list position
 
     def extract_run_text(run):
         """Extract text from a run with formatting."""
@@ -120,39 +137,117 @@ def docx_to_md(docx_path):
             return text
         return text
 
+    def get_formatted_text(para):
+        """Get paragraph text with inline formatting and hyperlinks."""
+        result = []
+
+        # Iterate through paragraph XML children to catch hyperlinks
+        for child in para._p:
+            if child.tag == qn('w:r'):
+                # Regular run - find matching run object
+                for run in para.runs:
+                    if run._r is child:
+                        result.append(extract_run_text(run))
+                        break
+            elif child.tag == qn('w:hyperlink'):
+                # Hyperlink element
+                r_id = child.get(qn('r:id'))
+                url = None
+                if r_id:
+                    try:
+                        rel = para.part.rels[r_id]
+                        url = rel.target_ref
+                    except (KeyError, AttributeError):
+                        pass
+
+                # Get text from runs inside hyperlink
+                link_text = ""
+                for run_elem in child.findall(qn('w:r')):
+                    for text_elem in run_elem.findall(qn('w:t')):
+                        if text_elem.text:
+                            link_text += text_elem.text
+
+                if url and link_text:
+                    result.append(f"[{link_text}]({url})")
+                elif link_text:
+                    result.append(link_text)
+
+        return "".join(result)
+
+    def get_cell_formatted_text(cell, is_header=False):
+        """Get cell text with inline formatting, joining paragraphs."""
+        parts = []
+        for para in cell.paragraphs:
+            if is_header:
+                # For header cells, get plain text (Word auto-bolds headers)
+                para_text = para.text.strip()
+            else:
+                para_text = get_formatted_text(para)
+            if para_text.strip():
+                parts.append(para_text.strip())
+        return " ".join(parts)
+
+    def check_space_before(para):
+        """Check if paragraph has space_before marker (indicating blank line in original)."""
+        if para.paragraph_format.space_before:
+            try:
+                space_pt = para.paragraph_format.space_before.pt if hasattr(para.paragraph_format.space_before, 'pt') else 0
+                if space_pt and space_pt >= 10:
+                    return True
+            except (AttributeError, TypeError):
+                pass
+        return False
+
     def process_paragraph(para):
         """Convert a paragraph to markdown."""
+        nonlocal list_number_counter
+
         # Check heading style
         style_name = para.style.name if para.style else ""
 
-        # Handle headings
+        has_space = check_space_before(para)
+
+        # Handle headings - return tuple (text, type)
         if style_name.startswith('Heading'):
             try:
                 level = int(style_name.replace('Heading', '').strip())
                 text = para.text.strip()
                 if level == 0 or style_name == 'Title':
-                    return f"# {text}"
+                    return (f"# {text}", "heading_spaced" if has_space else True)
                 else:
-                    return f"{'#' * (level + 1)} {text}"
+                    return (f"{'#' * (level + 1)} {text}", "heading_spaced" if has_space else True)
             except ValueError:
                 pass
 
         if style_name == 'Title':
-            return f"# {para.text.strip()}"
+            return (f"# {para.text.strip()}", "heading_spaced" if has_space else True)
 
         # Handle lists
         if style_name == 'List Bullet':
             text = get_formatted_text(para)
             indent = ""
             if para.paragraph_format.left_indent:
-                indent_inches = para.paragraph_format.left_indent.inches if hasattr(para.paragraph_format.left_indent, 'inches') else 0
-                if indent_inches and indent_inches >= 0.4:
-                    indent = "  "
-            return f"{indent}- {text}"
+                try:
+                    indent_inches = para.paragraph_format.left_indent.inches if hasattr(para.paragraph_format.left_indent, 'inches') else 0
+                    if indent_inches and indent_inches >= 0.4:
+                        indent = "  "  # 2 spaces for sub-list
+                        # Don't reset counter - this is a sub-list
+                except (AttributeError, TypeError):
+                    pass
+            if not indent:
+                list_number_counter = 0  # Only reset if not a sub-list
+            return (f"{indent}- {text}", "spaced" if has_space else False)
 
         if style_name == 'List Number':
+            list_number_counter += 1
             text = get_formatted_text(para)
-            return f"1. {text}"
+            return (f"{list_number_counter}. {text}", "spaced" if has_space else False)
+
+        # Check for horizontal rule (line of dashes or similar)
+        text = para.text.strip()
+        if text and all(c in '─-—' for c in text) and len(text) > 10:
+            list_number_counter = 0  # Reset numbered list counter
+            return ("---", "hr")  # Special marker for horizontal rule
 
         # Handle blockquotes (indented paragraphs)
         if para.paragraph_format.left_indent:
@@ -160,34 +255,24 @@ def docx_to_md(docx_path):
                 indent_val = para.paragraph_format.left_indent.inches if hasattr(para.paragraph_format.left_indent, 'inches') else 0
                 if indent_val and indent_val >= 0.4 and style_name not in ['List Bullet', 'List Number']:
                     text = get_formatted_text(para)
-                    return f"> {text}"
+                    return (f"> {text}", "spaced" if has_space else False)
             except (AttributeError, TypeError):
                 pass
 
-        # Check for horizontal rule (line of dashes or similar)
-        text = para.text.strip()
-        if text and all(c in '─-—' for c in text) and len(text) > 10:
-            return "---"
-
-        # Regular paragraph
+        # Regular paragraph - reset list counter
+        list_number_counter = 0
         formatted = get_formatted_text(para)
-        return formatted if formatted else ""
-
-    def get_formatted_text(para):
-        """Get paragraph text with inline formatting."""
-        result = []
-        for run in para.runs:
-            result.append(extract_run_text(run))
-        return "".join(result)
+        return (formatted if formatted else "", "spaced" if has_space else False)
 
     def process_table(table):
         """Convert a table to markdown."""
         rows = []
-        for row in table.rows:
+        for row_idx, row in enumerate(table.rows):
             cells = []
+            is_header_row = (row_idx == 0)
             for cell in row.cells:
-                # Get cell text, joining paragraphs
-                cell_text = " ".join(p.text.strip() for p in cell.paragraphs if p.text.strip())
+                # Get cell text - header row uses plain text (Word auto-bolds headers)
+                cell_text = get_cell_formatted_text(cell, is_header=is_header_row)
                 cells.append(cell_text)
             rows.append(cells)
 
@@ -197,9 +282,12 @@ def docx_to_md(docx_path):
         md_table = []
         # Header row
         if rows:
+            # Use header cell widths + 2 for separators (matches typical markdown editors)
+            col_widths = [max(len(cell) + 2, 3) for cell in rows[0]]
+
             md_table.append("| " + " | ".join(rows[0]) + " |")
-            # Separator
-            md_table.append("| " + " | ".join(["---"] * len(rows[0])) + " |")
+            separators = ["-" * w for w in col_widths]
+            md_table.append("|" + "|".join(separators) + "|")
             # Data rows
             for row in rows[1:]:
                 # Pad row if necessary
@@ -210,14 +298,37 @@ def docx_to_md(docx_path):
         return md_table
 
     # Process document elements in order
+    prev_was_heading = False
     for element in doc.element.body:
         if element.tag.endswith('p'):
             # Find corresponding paragraph
             for para in doc.paragraphs:
                 if para._element is element:
-                    line = process_paragraph(para)
+                    result = process_paragraph(para)
+                    line, line_type = result
+
+                    is_heading = line_type == True or line_type == "heading_spaced"
+                    is_heading_spaced = line_type == "heading_spaced"
+                    is_hr = line_type == "hr"
+                    is_spaced = line_type == "spaced"
+
+                    # Add blank line before horizontal rule
+                    if is_hr and md_lines and md_lines[-1] != "":
+                        md_lines.append("")
+
+                    # Add blank line before paragraph/heading that had space_before
+                    if (is_spaced or is_heading_spaced) and md_lines and md_lines[-1] != "":
+                        md_lines.append("")
+
+                    # Add blank line after previous heading/hr if this is content
+                    if prev_was_heading and line and not is_hr and not is_heading:
+                        if md_lines and md_lines[-1] != "":
+                            md_lines.append("")
+
                     if line or (md_lines and md_lines[-1] != ""):
                         md_lines.append(line)
+
+                    prev_was_heading = is_heading or is_hr
                     break
         elif element.tag.endswith('tbl'):
             # Find corresponding table
@@ -228,6 +339,8 @@ def docx_to_md(docx_path):
                         md_lines.append("")
                     md_lines.extend(process_table(table))
                     md_lines.append("")
+                    prev_was_heading = False
+                    list_number_counter = 0  # Reset after table
                     break
 
     # Clean up multiple blank lines
@@ -244,7 +357,7 @@ def docx_to_md(docx_path):
     while cleaned and cleaned[-1] == "":
         cleaned.pop()
 
-    content = "\n".join(cleaned)
+    content = "\n".join(cleaned) + "\n"  # Add trailing newline
 
     with open(md_path, 'w', encoding='utf-8') as f:
         f.write(content)

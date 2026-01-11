@@ -87,7 +87,10 @@ def md_to_docx(md_path):
     """Convert markdown file to docx, saving in same location."""
     import re
     from docx import Document
-    from docx.shared import Inches, Pt
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
 
     md_path = Path(md_path)
 
@@ -96,9 +99,24 @@ def md_to_docx(md_path):
         sys.exit(1)
 
     if md_path.suffix.lower() != '.md':
-        print(f"Warning: File doesn't have .md extension: {md_path}")
+        print(f"Error: File must have .md extension: {md_path}")
+        print("Use docx2md.py to convert .docx files to .md")
+        sys.exit(1)
 
     docx_path = md_path.with_suffix('.docx')
+
+    # Handle existing file
+    if docx_path.exists():
+        response = input(f"File '{docx_path.name}' already exists. Overwrite? (y/n): ").strip().lower()
+        if response not in ('y', 's', 'yes', 'si'):
+            # Find next available number
+            counter = 1
+            while True:
+                new_path = docx_path.parent / f"{docx_path.stem} ({counter}){docx_path.suffix}"
+                if not new_path.exists():
+                    docx_path = new_path
+                    break
+                counter += 1
 
     with open(md_path, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -135,6 +153,36 @@ def md_to_docx(md_path):
                             run.bold = True
         doc.add_paragraph()
 
+    def add_hyperlink(paragraph, url, text):
+        """Add a hyperlink to a paragraph."""
+        part = paragraph.part
+        r_id = part.relate_to(url, RT.HYPERLINK, is_external=True)
+
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('r:id'), r_id)
+
+        new_run = OxmlElement('w:r')
+        rPr = OxmlElement('w:rPr')
+
+        # Blue color for hyperlink
+        color = OxmlElement('w:color')
+        color.set(qn('w:val'), '0563C1')
+        rPr.append(color)
+
+        # Underline
+        u = OxmlElement('w:u')
+        u.set(qn('w:val'), 'single')
+        rPr.append(u)
+
+        new_run.append(rPr)
+
+        text_elem = OxmlElement('w:t')
+        text_elem.text = text
+        new_run.append(text_elem)
+
+        hyperlink.append(new_run)
+        paragraph._p.append(hyperlink)
+
     def add_formatted_text(paragraph, text):
         pattern = r'\[([^\]]+)\]\(([^)]+)\)'
         parts = re.split(pattern, text)
@@ -143,9 +191,10 @@ def md_to_docx(md_path):
             if idx + 2 < len(parts) and idx % 3 == 0:
                 if parts[idx]:
                     add_styled_text(paragraph, parts[idx])
-                if idx + 1 < len(parts):
-                    run = paragraph.add_run(parts[idx + 1])
-                    run.underline = True
+                # Add hyperlink with URL
+                link_text = parts[idx + 1]
+                link_url = parts[idx + 2]
+                add_hyperlink(paragraph, link_url, link_text)
                 idx += 3
             else:
                 if parts[idx]:
@@ -168,6 +217,7 @@ def md_to_docx(md_path):
                         if ip:
                             paragraph.add_run(ip)
 
+    prev_blank = False  # Track if previous line was blank
     while i < len(lines):
         line = lines[i]
 
@@ -176,34 +226,49 @@ def md_to_docx(md_path):
                 create_table(doc, table_data)
                 table_data = []
                 in_table = False
+            prev_blank = True
             i += 1
             continue
 
         if line.strip() == '---':
             if not in_table:
                 doc.add_paragraph('─' * 50)
+            prev_blank = False
             i += 1
             continue
 
         if line.startswith('# '):
-            doc.add_heading(line[2:].strip(), level=0)
+            h = doc.add_heading(line[2:].strip(), level=0)
+            if prev_blank:
+                h.paragraph_format.space_before = Pt(12)
+            prev_blank = False
             i += 1
             continue
         elif line.startswith('## '):
-            doc.add_heading(line[3:].strip(), level=1)
+            h = doc.add_heading(line[3:].strip(), level=1)
+            if prev_blank:
+                h.paragraph_format.space_before = Pt(12)
+            prev_blank = False
             i += 1
             continue
         elif line.startswith('### '):
-            doc.add_heading(line[4:].strip(), level=2)
+            h = doc.add_heading(line[4:].strip(), level=2)
+            if prev_blank:
+                h.paragraph_format.space_before = Pt(12)
+            prev_blank = False
             i += 1
             continue
         elif line.startswith('#### '):
-            doc.add_heading(line[5:].strip(), level=3)
+            h = doc.add_heading(line[5:].strip(), level=3)
+            if prev_blank:
+                h.paragraph_format.space_before = Pt(12)
+            prev_blank = False
             i += 1
             continue
 
         if line.strip().startswith('|') and line.strip().endswith('|'):
             in_table = True
+            prev_blank = False
             if re.match(r'^\|[\s\-:|]+\|$', line.strip()):
                 i += 1
                 continue
@@ -216,17 +281,34 @@ def md_to_docx(md_path):
             table_data = []
             in_table = False
 
+        # Sub-list: 2+ spaces before "- " (must check BEFORE regular bullet)
+        if re.match(r'^  +- ', line):
+            text = line.strip()[2:]
+            p = doc.add_paragraph(style='List Bullet')
+            p.paragraph_format.left_indent = Inches(0.5)
+            add_formatted_text(p, text)
+            prev_blank = False
+            i += 1
+            continue
+
         if line.strip().startswith('- '):
             text = line.strip()[2:]
             p = doc.add_paragraph(style='List Bullet')
+            if prev_blank:
+                p.paragraph_format.space_before = Pt(12)
             add_formatted_text(p, text)
+            prev_blank = False
             i += 1
             continue
 
         if re.match(r'^\d+\.\s', line.strip()):
             text = re.sub(r'^\d+\.\s', '', line.strip())
             p = doc.add_paragraph(style='List Number')
+            # Mark with space_before if preceded by blank line (for round-trip)
+            if prev_blank:
+                p.paragraph_format.space_before = Pt(12)
             add_formatted_text(p, text)
+            prev_blank = False
             i += 1
             continue
 
@@ -234,22 +316,20 @@ def md_to_docx(md_path):
             text = line.strip()[2:]
             p = doc.add_paragraph()
             p.paragraph_format.left_indent = Inches(0.5)
+            if prev_blank:
+                p.paragraph_format.space_before = Pt(12)
             add_formatted_text(p, text)
-            i += 1
-            continue
-
-        if line.startswith('  - '):
-            text = line.strip()[2:]
-            p = doc.add_paragraph(style='List Bullet')
-            p.paragraph_format.left_indent = Inches(0.5)
-            add_formatted_text(p, text)
+            prev_blank = False
             i += 1
             continue
 
         if line.strip():
             p = doc.add_paragraph()
+            if prev_blank:
+                p.paragraph_format.space_before = Pt(12)
             add_formatted_text(p, line.strip())
 
+        prev_blank = False
         i += 1
 
     if table_data:
